@@ -2,6 +2,7 @@ name: Nur • verify and build
 on:
   push:
     branches: [main, master]
+  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
@@ -56,6 +57,8 @@ jobs:
       - name: Static and data checks
         working-directory: ${{ env.PROJECT_ROOT }}
         run: |
+          python3 tools/check_compose_actions.py
+          python3 tools/test_compose_actions.py
           python3 tools/kt_sanity.py
           python3 tools/kt_symbols.py
           python3 tools/source_audit.py
@@ -63,11 +66,17 @@ jobs:
           python3 tools/test_kt_symbols.py
           python3 tools/verify_cities.py
           python3 tools/verify_uz_table.py
+          python3 tools/test_build_regressions.py
+      - name: Compile app and every test source set first
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:compileDebugKotlin :app:compileReleaseKotlin :app:compileDebugUnitTestKotlin :app:compileDebugAndroidTestKotlin --stacktrace 2>&1 | tee build.log
       - name: Unit tests, lint and both APKs
         working-directory: ${{ env.PROJECT_ROOT }}
         run: |
           set -o pipefail
-          gradle --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest --stacktrace 2>&1 | tee build.log
+          gradle --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest --stacktrace 2>&1 | tee -a build.log
       - name: Reports and build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -89,4 +98,53 @@ jobs:
         with:
           name: nur-ui-test-apk
           path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/androidTest/debug/*.apk
+
+  ui-tests:
+    name: UI tests / Android ${{ matrix.api-level }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [26, 34]
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@v4
+        with:
+          name: nur-debug-apk
+          path: apks/debug
+      - uses: actions/download-artifact@v4
+        with:
+          name: nur-ui-test-apk
+          path: apks/tests
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the built test APK (not just assemble it)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: google_apis
+          profile: pixel_2
+          disable-animations: true
+          script: |
+            adb install -r apks/debug/*.apk
+            adb install -r apks/tests/*.apk
+            adb shell am instrument -w -r com.nur.prayer.debug.test/androidx.test.runner.AndroidJUnitRunner > ui-tests.log 2>&1
+            cat ui-tests.log
+            grep -Eq '^OK \([1-9][0-9]* tests?\)' ui-tests.log
+      - name: UI test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nur-ui-results-api-${{ matrix.api-level }}
+          path: ui-tests.log
+          if-no-files-found: warn
           
