@@ -1,83 +1,92 @@
-name: Build APK from ZIP
-
+name: Nur • verify and build
 on:
-  workflow_dispatch:
   push:
-    branches: [ main, master ]
-
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: nur-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Unpack source zip
+      - uses: actions/checkout@v4
+      - name: Locate latest numeric source version
+        shell: bash
         run: |
-          set -e
-          ZIP=$(ls -1 *.zip | sort | tail -n 1)
-          echo "Using archive: $ZIP"
-          mkdir -p _src
-          unzip -q "$ZIP" -d _src
-          ROOT=$(dirname "$(find _src -name settings.gradle.kts | head -n 1)")
-          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+          python3 - <<'PYTHON'
+          import os, re, pathlib, zipfile, stat
+          repo = pathlib.Path.cwd()
+          if (repo / "settings.gradle.kts").is_file():
+              root = repo
+          else:
+              candidates = []
+              for p in repo.glob("*.zip"):
+                  m = re.fullmatch(r"nur_prayer[._-](\d+(?:\.\d+)*)\.zip", p.name, re.I)
+                  if m: candidates.append((tuple(map(int, m[1].split("."))), p))
+              if not candidates: raise SystemExit("No versioned source archive found")
+              archive = max(candidates, key=lambda item: item[0])[1]
+              print("Source archive:", archive.name)
+              target = repo / "_source"
+              with zipfile.ZipFile(archive) as z:
+                  if sum(i.file_size for i in z.infolist()) > 200 * 1024 * 1024:
+                      raise SystemExit("Archive too large")
+                  for i in z.infolist():
+                      name = pathlib.PurePosixPath(i.filename)
+                      if name.is_absolute() or ".." in name.parts or "\\" in i.filename or stat.S_ISLNK(i.external_attr >> 16):
+                          raise SystemExit("Unsafe archive path")
+                  z.extractall(target)
+              roots = list(target.rglob("settings.gradle.kts"))
+              if len(roots) != 1: raise SystemExit("Expected exactly one Gradle project")
+              root = roots[0].parent
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("PROJECT_ROOT=" + str(root) + "\n")
+          PYTHON
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-
-      - name: Build debug APK
-        id: build
-        continue-on-error: true
+      - name: Static and data checks
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          python3 tools/kt_sanity.py
+          python3 tools/kt_symbols.py
+          python3 tools/source_audit.py
+          python3 tools/test_source_archive.py
+          python3 tools/test_kt_symbols.py
+          python3 tools/verify_cities.py
+          python3 tools/verify_uz_table.py
+      - name: Unit tests, lint and both APKs
         working-directory: ${{ env.PROJECT_ROOT }}
         run: |
           set -o pipefail
-          gradle --no-daemon :app:assembleDebug --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-
-      - name: Error summary
-        if: steps.build.outcome == 'failure'
-        run: |
-          echo "================ ERROR SUMMARY ================"
-          grep -nE "^e: |^w: .*error|error:|Unresolved reference|Caused by|What went wrong|FAILURE:|Execution failed for task" build.log \
-            | grep -v "warning" | head -n 60
-          echo "==============================================="
-          {
-            echo "## Error summary"
-            echo '```'
-            grep -nE "^e: |error:|Unresolved reference|Caused by|What went wrong|FAILURE:|Execution failed for task" build.log | head -n 40
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Collect APK
-        if: steps.build.outcome == 'success'
-        run: |
-          find "$PROJECT_ROOT" -name "*.apk" -exec cp {} NurPrayer.apk \;
-          ls -lh NurPrayer.apk
-
-      - name: Upload APK
-        if: steps.build.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: NurPrayer-APK
-          path: NurPrayer.apk
-          retention-days: 30
-
-      - name: Upload full log
+          gradle --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest --stacktrace 2>&1 | tee build.log
+      - name: Reports and build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: build.log
-          retention-days: 30
-
-      - name: Fail if build failed
-        if: steps.build.outcome == 'failure'
-        run: exit 1
-        
+          name: nur-reports
+          path: |
+            ${{ env.PROJECT_ROOT }}/build.log
+            ${{ env.PROJECT_ROOT }}/app/build/reports/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nur-debug-apk
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nur-release-apk-test-key
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/release/*.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nur-ui-test-apk
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/androidTest/debug/*.apk
+          
