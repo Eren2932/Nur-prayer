@@ -31,7 +31,7 @@ jobs:
               # A renamed upload such as "nur_prayer.0.6.0 (1).zip" used to be skipped silently,
               # so CI quietly built the previous release. Refuse instead of guessing.
               stray = [p.name for p in repo.glob("*.zip")
-                       if p.name.lower().startswith("nur_prayer") and p.name not in {c[1].name for c in candidates}]
+                       if re.match(r"nur[\W_]*prayer", p.name, re.I) and p.name not in {c[1].name for c in candidates}]
               if stray: raise SystemExit("Archive name must be nur_prayer.X.Y.Z.zip, got: " + ", ".join(stray))
               if not candidates: raise SystemExit("No versioned source archive found")
               archive = max(candidates, key=lambda item: item[0])[1]
