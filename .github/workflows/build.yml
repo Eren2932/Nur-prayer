@@ -15,44 +15,78 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-      - name: Locate latest numeric source version
+      - name: Locate the newest Nur source archive (by its contents, not its file name)
         shell: bash
         run: |
           python3 - <<'PYTHON'
           import os, re, pathlib, zipfile, stat
+
           repo = pathlib.Path.cwd()
+          MAX_UNPACKED = 200 * 1024 * 1024
+
+
+          def scan(archive):
+              """(versionCode, versionName, gradle_dir_in_zip) if the zip holds exactly one Nur Gradle project."""
+              try:
+                  with zipfile.ZipFile(archive) as z:
+                      names = [n for n in z.namelist() if not n.endswith("/")]
+                      roots = [n[: -len("settings.gradle.kts")] for n in names if n.endswith("settings.gradle.kts")]
+                      roots = [r for r in roots if r == "" or r.endswith("/")]
+                      if len(roots) != 1:
+                          return None
+                      gradle_name = roots[0] + "app/build.gradle.kts"
+                      if gradle_name not in names:
+                          return None
+                      gradle = z.read(gradle_name).decode("utf-8", "replace")
+              except (zipfile.BadZipFile, OSError):
+                  return None
+              name = re.search(r'^\s*versionName\s*=\s*"(\d+(?:\.\d+)*)"', gradle, re.M)
+              code = re.search(r'^\s*versionCode\s*=\s*(\d+)', gradle, re.M)
+              if "com.nur.prayer" not in gradle or not name or not code:
+                  return None  # a zip, but not ours: logs, reports, someone else's project
+              return int(code[1]), tuple(map(int, name[1].split("."))), name[1], roots[0]
+
+
           if (repo / "settings.gradle.kts").is_file():
               root = repo
+              source = "repository root"
           else:
-              candidates = []
-              for p in repo.glob("*.zip"):
-                  m = re.fullmatch(r"nur_prayer[._-](\d+(?:\.\d+)*)\.zip", p.name, re.I)
-                  if m: candidates.append((tuple(map(int, m[1].split("."))), p))
-              # A renamed upload such as "nur_prayer.0.6.0 (1).zip" used to be skipped silently,
-              # so CI quietly built the previous release. Refuse instead of guessing.
-              stray = [p.name for p in repo.glob("*.zip")
-                       if re.match(r"nur[\W_]*prayer", p.name, re.I) and p.name not in {c[1].name for c in candidates}]
-              if stray: raise SystemExit("Archive name must be nur_prayer.X.Y.Z.zip, got: " + ", ".join(stray))
-              if not candidates: raise SystemExit("No versioned source archive found")
-              archive = max(candidates, key=lambda item: item[0])[1]
-              print("Source archive:", archive.name)
+              found = []
+              for p in sorted(repo.glob("*.zip")):
+                  info = scan(p)
+                  verdict = f"Nur {info[2]} (versionCode {info[0]})" if info else "not a Nur source archive, skipped"
+                  print(f"  {p.name}: {verdict}")
+                  if info:
+                      tidy = bool(re.fullmatch(r"nur_prayer[._-]\d+(?:\.\d+)*\.zip", p.name))
+                      found.append((info[0], info[1], tidy, p.name, p, info))
+              if not found:
+                  raise SystemExit("No Nur source archive found in the repository root")
+              # The release is decided by what is INSIDE the archive (versionCode, then versionName), never by
+              # how the file was named or uploaded. Same release twice: the properly named file wins.
+              found.sort(key=lambda f: f[:4])
+              top = found[-1]
+              twins = [f for f in found if f[:2] == top[:2]]
+              if len(twins) > 1:
+                  print("Same release in several archives, using", top[3], "; others:", ", ".join(f[3] for f in twins[:-1]))
+              archive, info = top[4], top[5]
+              source = archive.name
               target = repo / "_source"
               with zipfile.ZipFile(archive) as z:
-                  if sum(i.file_size for i in z.infolist()) > 200 * 1024 * 1024:
+                  if sum(i.file_size for i in z.infolist()) > MAX_UNPACKED:
                       raise SystemExit("Archive too large")
                   for i in z.infolist():
                       name = pathlib.PurePosixPath(i.filename)
                       if name.is_absolute() or ".." in name.parts or "\\" in i.filename or stat.S_ISLNK(i.external_attr >> 16):
                           raise SystemExit("Unsafe archive path")
                   z.extractall(target)
-              roots = list(target.rglob("settings.gradle.kts"))
-              if len(roots) != 1: raise SystemExit("Expected exactly one Gradle project")
-              root = roots[0].parent
+              root = (target / info[3]).resolve() if info[3] else target
+
           gradle = (root / "app/build.gradle.kts").read_text()
           version = re.search(r'versionName\s*=\s*"([^"]+)"', gradle)[1]
-          print("Building Nur", version)
+          code = re.search(r'versionCode\s*=\s*(\d+)', gradle)[1]
+          print(f"Building Nur {version} (versionCode {code}) from {source}")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write("### Built source: Nur " + version + "\n")
+              f.write(f"### Built source: Nur {version} (versionCode {code})\nArchive: `{source}`\n")
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write("PROJECT_ROOT=" + str(root) + "\n")
           PYTHON
