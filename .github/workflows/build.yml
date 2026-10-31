@@ -28,6 +28,11 @@ jobs:
               for p in repo.glob("*.zip"):
                   m = re.fullmatch(r"nur_prayer[._-](\d+(?:\.\d+)*)\.zip", p.name, re.I)
                   if m: candidates.append((tuple(map(int, m[1].split("."))), p))
+              # A renamed upload such as "nur_prayer.0.6.0 (1).zip" used to be skipped silently,
+              # so CI quietly built the previous release. Refuse instead of guessing.
+              stray = [p.name for p in repo.glob("*.zip")
+                       if p.name.lower().startswith("nur_prayer") and p.name not in {c[1].name for c in candidates}]
+              if stray: raise SystemExit("Archive name must be nur_prayer.X.Y.Z.zip, got: " + ", ".join(stray))
               if not candidates: raise SystemExit("No versioned source archive found")
               archive = max(candidates, key=lambda item: item[0])[1]
               print("Source archive:", archive.name)
@@ -43,6 +48,11 @@ jobs:
               roots = list(target.rglob("settings.gradle.kts"))
               if len(roots) != 1: raise SystemExit("Expected exactly one Gradle project")
               root = roots[0].parent
+          gradle = (root / "app/build.gradle.kts").read_text()
+          version = re.search(r'versionName\s*=\s*"([^"]+)"', gradle)[1]
+          print("Building Nur", version)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("### Built source: Nur " + version + "\n")
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write("PROJECT_ROOT=" + str(root) + "\n")
           PYTHON
