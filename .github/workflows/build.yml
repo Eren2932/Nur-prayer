@@ -1,0 +1,164 @@
+name: Nur • verify and build
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: nur-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Locate latest numeric source version
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os, re, pathlib, zipfile, stat
+          repo = pathlib.Path.cwd()
+          if (repo / "settings.gradle.kts").is_file():
+              root = repo
+          else:
+              candidates = []
+              for p in repo.glob("*.zip"):
+                  m = re.fullmatch(r"nur_prayer[._-](\d+(?:\.\d+)*)\.zip", p.name, re.I)
+                  if m: candidates.append((tuple(map(int, m[1].split("."))), p))
+              if not candidates: raise SystemExit("No versioned source archive found")
+              archive = max(candidates, key=lambda item: item[0])[1]
+              print("Source archive:", archive.name)
+              target = repo / "_source"
+              with zipfile.ZipFile(archive) as z:
+                  if sum(i.file_size for i in z.infolist()) > 200 * 1024 * 1024:
+                      raise SystemExit("Archive too large")
+                  for i in z.infolist():
+                      name = pathlib.PurePosixPath(i.filename)
+                      if name.is_absolute() or ".." in name.parts or "\\" in i.filename or stat.S_ISLNK(i.external_attr >> 16):
+                          raise SystemExit("Unsafe archive path")
+                  z.extractall(target)
+              roots = list(target.rglob("settings.gradle.kts"))
+              if len(roots) != 1: raise SystemExit("Expected exactly one Gradle project")
+              root = roots[0].parent
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("PROJECT_ROOT=" + str(root) + "\n")
+          PYTHON
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # ubuntu-latest ships an Android SDK. Using it removes a third-party action (and its own
+      # Node runtime) from the critical path; licences are accepted here so AGP can fetch any
+      # missing platform or build-tools package by itself.
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK" || { echo "No preinstalled Android SDK at $SDK"; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$(command -v sdkmanager || ls "$SDK"/cmdline-tools/*/bin/sdkmanager | head -n1)"
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0" "platform-tools" 2>&1 | tail -n 5 || true
+          ls "$SDK/platforms" "$SDK/build-tools"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Static and data checks
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          python3 tools/check_compose_actions.py
+          python3 tools/test_compose_actions.py
+          python3 tools/kt_sanity.py
+          python3 tools/kt_symbols.py
+          python3 tools/source_audit.py
+          python3 tools/test_amoled_source.py
+          python3 tools/test_source_archive.py
+          python3 tools/test_kt_symbols.py
+          python3 tools/verify_cities.py
+          python3 tools/verify_uz_table.py
+          python3 tools/test_build_regressions.py
+      - name: Compile app and every test source set first
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:compileDebugKotlin :app:compileReleaseKotlin :app:compileDebugUnitTestKotlin :app:compileDebugAndroidTestKotlin --stacktrace 2>&1 | tee build.log
+      - name: Unit tests, lint and both APKs
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          set -o pipefail
+          gradle --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest --stacktrace 2>&1 | tee -a build.log
+      - name: Reports and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nur-reports
+          path: |
+            ${{ env.PROJECT_ROOT }}/build.log
+            ${{ env.PROJECT_ROOT }}/app/build/reports/
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nur-debug-apk
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/debug/*.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nur-release-apk-test-key
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/release/*.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nur-ui-test-apk
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/androidTest/debug/*.apk
+
+  ui-tests:
+    name: UI tests / Android ${{ matrix.api-level }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [26, 34]
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@v4
+        with:
+          name: nur-debug-apk
+          path: apks/debug
+      - uses: actions/download-artifact@v4
+        with:
+          name: nur-ui-test-apk
+          path: apks/tests
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the built test APK (not just assemble it)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: google_apis
+          profile: pixel_2
+          disable-animations: true
+          script: |
+            adb install -r apks/debug/*.apk
+            adb install -r apks/tests/*.apk
+            adb shell am instrument -w -r com.nur.prayer.debug.test/androidx.test.runner.AndroidJUnitRunner > ui-tests.log 2>&1
+            cat ui-tests.log
+            grep -Eq '^OK \([1-9][0-9]* tests?\)' ui-tests.log
+      - name: UI test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nur-ui-results-api-${{ matrix.api-level }}
+          path: ui-tests.log
+          if-no-files-found: warn
