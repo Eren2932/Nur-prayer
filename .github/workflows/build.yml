@@ -82,6 +82,7 @@ jobs:
         working-directory: ${{ env.PROJECT_ROOT }}
         run: |
           python3 tools/check_compose_actions.py
+          python3 tools/check_ui_test_literals.py
           python3 tools/test_compose_actions.py
           python3 tools/kt_sanity.py
           python3 tools/kt_symbols.py
