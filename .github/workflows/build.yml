@@ -15,60 +15,81 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
+      # The release is chosen by what is INSIDE each archive (versionCode), never by its file name.
+      # 0.22.0 was uploaded from a phone as "nur_prayer.0.22.0.zip.~" (64 KB of 14 MB, an unfinished
+      # download): it did not match *.zip, nothing complained, and CI quietly built 0.21.1. Now every
+      # file that looks like a Nur archive is opened; a broken one that claims a newer version than the
+      # best valid archive stops the build with a message saying exactly which file to re-upload.
       - name: Locate the newest Nur source archive (by its contents, not its file name)
         shell: bash
         run: |
           python3 - <<'PYTHON'
           import os, re, pathlib, zipfile, stat
-
           repo = pathlib.Path.cwd()
           MAX_UNPACKED = 200 * 1024 * 1024
-
+          NAMED = re.compile(r"nur[_-]?prayer[._ -]*(\d+(?:\.\d+)+)", re.I)
 
           def scan(archive):
-              """(versionCode, versionName, gradle_dir_in_zip) if the zip holds exactly one Nur Gradle project."""
+              """(versionCode, versionTuple, versionName, gradle_dir) or a string saying why not."""
               try:
                   with zipfile.ZipFile(archive) as z:
                       names = [n for n in z.namelist() if not n.endswith("/")]
                       roots = [n[: -len("settings.gradle.kts")] for n in names if n.endswith("settings.gradle.kts")]
                       roots = [r for r in roots if r == "" or r.endswith("/")]
                       if len(roots) != 1:
-                          return None
+                          return "no single Gradle project inside"
                       gradle_name = roots[0] + "app/build.gradle.kts"
                       if gradle_name not in names:
-                          return None
+                          return "no app/build.gradle.kts inside"
                       gradle = z.read(gradle_name).decode("utf-8", "replace")
-              except (zipfile.BadZipFile, OSError):
-                  return None
+              except (zipfile.BadZipFile, OSError, EOFError) as e:
+                  return f"not a readable zip ({e.__class__.__name__}): truncated or unfinished upload"
               name = re.search(r'^\s*versionName\s*=\s*"(\d+(?:\.\d+)*)"', gradle, re.M)
               code = re.search(r'^\s*versionCode\s*=\s*(\d+)', gradle, re.M)
               if "com.nur.prayer" not in gradle or not name or not code:
-                  return None  # a zip, but not ours: logs, reports, someone else's project
+                  return "a zip, but not the Nur project"
               return int(code[1]), tuple(map(int, name[1].split("."))), name[1], roots[0]
 
+          def kb(p): return f"{p.stat().st_size // 1024} KB"
 
           if (repo / "settings.gradle.kts").is_file():
-              root = repo
-              source = "repository root"
+              root, source = repo, "repository root"
           else:
-              found = []
-              for p in sorted(repo.glob("*.zip")):
+              found, broken = [], []
+              files = sorted(p for p in repo.iterdir() if p.is_file())
+              for p in files:
+                  claimed = NAMED.match(p.name)
+                  if not (p.suffix.lower() == ".zip" or claimed):
+                      continue
                   info = scan(p)
-                  verdict = f"Nur {info[2]} (versionCode {info[0]})" if info else "not a Nur source archive, skipped"
-                  print(f"  {p.name}: {verdict}")
-                  if info:
-                      tidy = bool(re.fullmatch(r"nur_prayer[._-]\d+(?:\.\d+)*\.zip", p.name))
-                      found.append((info[0], info[1], tidy, p.name, p, info))
+                  if isinstance(info, tuple):
+                      print(f"  {p.name} ({kb(p)}): Nur {info[2]} (versionCode {info[0]})")
+                      if claimed and claimed[1] != info[2]:
+                          print(f"::warning::{p.name} contains Nur {info[2]}, not {claimed[1]} as its name says")
+                      found.append((info[0], info[1], p.name == f"nur_prayer.{info[2]}.zip", p.name, p, info))
+                  else:
+                      print(f"  {p.name} ({kb(p)}): skipped, {info}")
+                      if claimed:
+                          broken.append((tuple(map(int, claimed[1].split("."))), p, info))
               if not found:
-                  raise SystemExit("No Nur source archive found in the repository root")
-              # The release is decided by what is INSIDE the archive (versionCode, then versionName), never by
-              # how the file was named or uploaded. Same release twice: the properly named file wins.
+                  raise SystemExit("No valid Nur source archive in the repository root")
               found.sort(key=lambda f: f[:4])
               top = found[-1]
+              archive, info = top[4], top[5]
+              newer = [b for b in broken if b[0] > info[1]]
+              for v, p, why in broken:
+                  if (v, p, why) not in newer:
+                      print(f"::warning::Old broken archive {p.name} ({kb(p)}) is ignored; it can be deleted")
+              if newer:
+                  lines = [f"{p.name} ({kb(p)}): {why}" for _, p, why in newer]
+                  msg = ("Newest archive is broken, refusing to fall back to Nur " + info[2] + ". "
+                         "Delete it and upload the full nur_prayer.X.Y.Z.zip again: " + "; ".join(lines))
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write("### Build stopped: broken upload\n\n" + "\n".join("- `" + l + "`" for l in lines) + "\n")
+                  raise SystemExit(msg)
               twins = [f for f in found if f[:2] == top[:2]]
               if len(twins) > 1:
-                  print("Same release in several archives, using", top[3], "; others:", ", ".join(f[3] for f in twins[:-1]))
-              archive, info = top[4], top[5]
+                  print("Same release in several archives, using", top[3])
               source = archive.name
               target = repo / "_source"
               with zipfile.ZipFile(archive) as z:
@@ -78,9 +99,11 @@ jobs:
                       name = pathlib.PurePosixPath(i.filename)
                       if name.is_absolute() or ".." in name.parts or "\\" in i.filename or stat.S_ISLNK(i.external_attr >> 16):
                           raise SystemExit("Unsafe archive path")
+                  bad = z.testzip()
+                  if bad:
+                      raise SystemExit(f"{archive.name} is corrupted (CRC error in {bad}); upload it again")
                   z.extractall(target)
               root = (target / info[3]).resolve() if info[3] else target
-
           gradle = (root / "app/build.gradle.kts").read_text()
           version = re.search(r'versionName\s*=\s*"([^"]+)"', gradle)[1]
           code = re.search(r'versionCode\s*=\s*(\d+)', gradle)[1]
@@ -107,7 +130,7 @@ jobs:
           SDKMANAGER="$(command -v sdkmanager || ls "$SDK"/cmdline-tools/*/bin/sdkmanager | head -n1)"
           set +o pipefail
           yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0" "platform-tools" 2>&1 | tail -n 5 || true
+          "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0" "platform-tools" 2>&1 | tail -n 5 || true
           ls "$SDK/platforms" "$SDK/build-tools"
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -120,6 +143,8 @@ jobs:
           python3 tools/test_compose_actions.py
           python3 tools/kt_sanity.py
           python3 tools/kt_symbols.py
+          python3 tools/kt_accessor_clash.py
+          python3 tools/test_kt_accessor_clash.py
           python3 tools/source_audit.py
           python3 tools/test_amoled_source.py
           python3 tools/test_source_archive.py
@@ -127,6 +152,17 @@ jobs:
           python3 tools/verify_cities.py
           python3 tools/verify_uz_table.py
           python3 tools/test_build_regressions.py
+          python3 tools/verify_learn.py
+          python3 tools/quran_data.py check
+          python3 tools/tajweed.py check
+          python3 tools/hifz_hints.py check
+          python3 tools/check_compose_specs.py
+          python3 tools/check_compose_imports.py
+          python3 tools/audio_manifest.py
+          python3 tools/check_launcher_icons.py
+          python3 tools/test_fonts.py
+          python3 -m pip install --quiet --disable-pip-version-check fonttools brotli
+          python3 tools/fonts.py check
       - name: Compile app and every test source set first
         working-directory: ${{ env.PROJECT_ROOT }}
         run: |
@@ -167,7 +203,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        api-level: [26, 34]
+        api-level: [26, 34, 35]
     steps:
       - uses: actions/setup-java@v4
         with:
@@ -186,20 +222,66 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # The emulator action runs every script line in its own shell, so the logic lives in a file.
+      # The runner is read from the installed test APK (pm list instrumentation) instead of being
+      # hard-coded: 0.22.1 moved to NurTestRunner and a stale name here would run zero tests.
+      # Failures are re-emitted as ::error:: annotations; unlike job logs and artifacts, those are
+      # readable through the public API, so a red run can be diagnosed without the raw log.
+      - name: Prepare UI test script
+        shell: bash
+        run: |
+          cat > run-ui-tests.sh <<'SH'
+          #!/usr/bin/env bash
+          set -u
+          adb install -r apks/debug/*.apk || exit 1
+          adb install -r apks/tests/*.apk || exit 1
+          RUNNER="$(adb shell pm list instrumentation | tr -d '\r' | sed -n 's#^instrumentation:\(com\.nur\.prayer[^ ]*\.test/[^ ]*\) .*#\1#p' | head -n1)"
+          if [ -z "$RUNNER" ]; then echo "::error title=UI tests::No Nur instrumentation installed"; adb shell pm list instrumentation; exit 1; fi
+          echo "Instrumentation: $RUNNER"
+          adb shell am instrument -w -r "$RUNNER" > ui-tests.log 2>&1
+          cat ui-tests.log
+          python3 ui-annotate.py ui-tests.log "$API_LEVEL"
+          SH
+          cat > ui-annotate.py <<'PY'
+          import os, re, sys
+          log, api = open(sys.argv[1], encoding="utf-8", errors="replace").read(), sys.argv[2]
+          def esc(t): return t.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          ok = re.search(r"^OK \(([1-9]\d*) tests?\)", log, re.M)
+          fails, cur, key = [], {}, None
+          for line in log.splitlines():
+              m = re.match(r"INSTRUMENTATION_STATUS: (\w+)=(.*)", line)
+              c = re.match(r"INSTRUMENTATION_STATUS_CODE: (-?\d+)", line)
+              if m:
+                  key = m[1]; cur[key] = m[2]
+              elif c:
+                  if c[1] in ("-1", "-2"): fails.append(dict(cur))
+                  cur, key = {}, None
+              elif key == "stack" and not line.startswith("INSTRUMENTATION_"):
+                  cur["stack"] += "\n" + line
+          for f in fails[:9]:
+              where = f.get("class", "?").rsplit(".", 1)[-1] + "." + f.get("test", "?")
+              stack = "\n".join(f.get("stack", "").splitlines()[:8])[:1500]
+              print(f"::error title=API {api} {where}::{esc(stack)}")
+          crash = re.search(r"INSTRUMENTATION_RESULT: (?:shortMsg|longMsg)=(.*)", log)
+          if crash and not ok: print(f"::error title=API {api} instrumentation::{esc(crash[1])}")
+          if not ok and not fails and not crash: print(f"::error title=API {api}::{esc(log[-1500:] or 'empty log')}")
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a") as s:
+              s.write(f"### UI tests, API {api}: " + (f"OK, {ok[1]} tests\n" if ok else f"{len(fails)} failed\n"))
+              for f in fails: s.write(f"- `{f.get('class','?')}.{f.get('test','?')}`\n")
+          sys.exit(0 if ok else 1)
+          PY
+          chmod +x run-ui-tests.sh
       - name: Run the built test APK (not just assemble it)
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          API_LEVEL: ${{ matrix.api-level }}
         with:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
           target: google_apis
           profile: pixel_2
           disable-animations: true
-          script: |
-            adb install -r apks/debug/*.apk
-            adb install -r apks/tests/*.apk
-            adb shell am instrument -w -r com.nur.prayer.debug.test/androidx.test.runner.AndroidJUnitRunner > ui-tests.log 2>&1
-            cat ui-tests.log
-            grep -Eq '^OK \([1-9][0-9]* tests?\)' ui-tests.log
+          script: ./run-ui-tests.sh
       - name: UI test report
         if: always()
         uses: actions/upload-artifact@v4
